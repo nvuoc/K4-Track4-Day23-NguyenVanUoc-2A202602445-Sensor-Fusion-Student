@@ -1,0 +1,173 @@
+Bước 1 · CP0 — Chuẩn bị repo, môi trường và dữ liệu
+Về bài lab này
+Hoàn thiện tracker EKF đa cảm biến, chạy Waymo ở hai chế độ và giải thích kết quả bằng log cùng metric.
+Bạn làm được gì sau bài này
+
+    Cài Part E–H: EKF 6D, association, mô hình đo camera và vòng đời track.
+    Chạy cùng segment Waymo ở chế độ LiDAR và LiDAR + camera để tạo artifacts có thể kiểm tra.
+    Diễn giải RMSE cùng matches, ghost và miss; nêu giới hạn của đo camera trong lab.
+
+Mục tiêu của lab: Xây phần tracking và fusion còn thiếu trong repo gốc K4-Track4-Day23-Sensor-Fusion-Student, chạy trên một segment Waymo và giải thích chênh lệch giữa LiDAR-only và LiDAR + camera bằng số liệu. Đây là bài cá nhân: bạn làm trên fork riêng, chuẩn bị CP0 ở nhà và hoàn thành CP1–CP6 trong 2 giờ trên lớp.
+
+Detector LiDAR đã có ở Part A–D: point cloud được đưa qua BEV và FPN-ResNet để tạo hộp xe 3D từng frame. Phần bạn viết là Part E–H: EKF dự báo trạng thái, association gán đo vào track, mô hình đo camera và quản lý vòng đời track. fusion-run-lab (Part I) chạy toàn pipeline và tạo metric/log; bạn sử dụng runner này, không sửa platform để tạo kết quả. Thứ tự trong một frame là predict một lần → cập nhật LiDAR → cập nhật camera nếu có. Camera dùng tâm hộp 2D ground-truth FRONT cộng nhiễu theo seed; lab không chạy detector ảnh, nên kết quả fused không chứng minh chất lượng camera detector.
+
+Đọc song song README, CHECKPOINTS, hướng dẫn kỹ thuật, RUBRIC và SUBMISSION của repo. Các file đó là nguồn chi tiết cho chữ ký hàm, checkpoint, chấm điểm và nộp bài.
+
+Thời gian: Ở nhà, trước buổi lab. Kết quả cần có: Fork cá nhân chạy được test ban đầu, có segment Waymo và weights ở máy local.
+
+    1. Fork repo gốc trên GitHub ở chế độ Public với tên K4-L2L3-DAY23-<HoVaTen>-<MSSV>-SensorFusion. Họ tên viết không dấu, không khoảng trắng, viết hoa đầu mỗi từ. Từ root repo sau khi clone, thêm remote upstream để nhận cập nhật của đề khi giảng viên thông báo:
+
+git clone https://github.com/<tai-khoan>/K4-L2L3-DAY23-<HoVaTen>-<MSSV>-SensorFusion.git
+cd K4-L2L3-DAY23-<HoVaTen>-<MSSV>-SensorFusion
+git remote add upstream https://github.com/VinUni-AI20k/K4-Track4-Day23-Sensor-Fusion-Student.git
+
+
+    1. Cài môi trường Python 3.12 từ root repo bằng một cách phù hợp. README đưa hai đường chính; Docker được mô tả trong hướng dẫn kỹ thuật. Sau khi cài, lệnh fusion-run-lab --help phải mở được phần trợ giúp:
+
+conda env create -f environment.yml
+conda activate day23_sensor_fusion
+
+Hoặc:
+
+uv venv -p 3.12 && source .venv/bin/activate
+uv pip install -e platform/third_party/waymo_reader -e platform -e student pytest
+
+
+    1. Tải dữ liệu và weights theo data/README.md từ Google Drive Day23-Fusion. Segment mặc định là training_segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord. Đặt .tfrecord trong data/Waymo/ và fpn_resnet_18_epoch_300.pth trong data/weights/pretrained_fpn-resnet/. Tạo .env và cấu hình đường dẫn local:
+
+cp .env.example .env
+set -a; source .env; set +a
+cp student/config/paths.example.yaml student/config/paths.yaml
+
+
+Chỉnh student/config/paths.yaml nếu bạn lưu dữ liệu ở nơi khác. .env và paths.yaml là file local, không commit.
+
+    1. Đọc sơ đồ pipeline và kiểm tra baseline. Xem §2 của hướng dẫn kỹ thuật, lướt các file Part A–D trong student/workspace/, điền phần thông tin học viên trong student/SUBMISSION.md, rồi chạy từ root repo:
+
+pytest student/tests -q
+fusion-run-lab --help
+ls data/Waymo/*.tfrecord data/weights/pretrained_fpn-resnet/*.pth
+
+Tự kiểm tra: pytest không có dòng failed; các test E–H còn stub được báo xfailed. Lệnh fusion-run-lab --help không lỗi import, và ls thấy cả .tfrecord lẫn .pth. Nếu macOS báo No module named 'fusion_lab' sau khi cài editable trong ~/Documents hoặc ~/Desktop, xem cách đặt venv ngoài các thư mục đó ở §3 của hướng dẫn kỹ thuật. Khi CP0 đạt, bạn có thể tập trung viết tracker trong giờ học.
+
+Bước 2 · CP1 — Cài EKF 6D trong Part E
+
+Thời gian: 0:00–0:25. Kết quả cần có: Test test_kalman.py đều passed và một commit CP1.
+Trạng thái nào đang được theo dõi?
+
+Detector cung cấp tâm hộp 3D của xe theo từng frame. Tracker dùng nó làm đo LiDAR z = (x, y, z) nhưng cần giữ trạng thái qua thời gian: vị trí (px, py, pz) và vận tốc (vx, vy, vz). Part E là EKF 6D với mô hình vận tốc không đổi. predict đưa track từ frame trước sang thời điểm frame hiện tại; update dùng đo đã gán để sửa ước lượng và độ bất định. F phụ thuộc dt, còn Q phản ánh nhiễu chuyển động và tăng theo dt cùng tham số q.
+
+Innovation γ = z − h(x) là phần chênh giữa đo và dự báo. Innovation covariance S = H P Hᵀ + R gộp độ bất định của track với đo. EKF dùng K = P Hᵀ S⁻¹ để update. LiDAR có H tuyến tính 3×6; camera ở bước sau dùng Jacobian. Những giá trị dt, q phải đọc từ get_tracking_params(), không viết cứng để chỉ pass một cấu hình.
+
+    1. Mở student/workspace/kalman.py; tìm các dòng # vi: TODO Part E và giữ nguyên tên, chữ ký hàm.
+    2. Cài build_F, build_Q, ekf_predict, innovation, innovation_covariance, ekf_update theo hợp đồng của stub và test trong repo. Kiểm tra kích thước state/covariance và đường đi của dt, q khi nối các hàm.
+    3. Chạy test Part E từ root repo; chỉ chuyển bước khi toàn bộ test báo passed:
+
+pytest student/tests/test_kalman.py -v
+
+    1. Commit kết quả với message dạng CP1: <việc vừa làm> để lưu trạng thái đã qua checkpoint.
+
+Tự kiểm tra: Một lỗi ở predict có thể làm sai mọi association phía sau, nên test_kalman.py phải pass trước khi bạn dùng EKF cho camera. Nếu test fail, đọc assertion và kiểm tra thứ tự predict/update, shape của F, Q, H, R, rồi chạy lại test này; không sửa test để hợp thức hóa code.
+
+Bước 3 · CP2 — Cài mô hình đo camera trong Part G
+
+Thời gian: 0:25–0:50. Kết quả cần có: Test camera đều passed và một commit CP2.
+Khi nào một track có thể tạo đo camera hợp lệ?
+
+Camera bổ sung đo 2D, không thay thế vị trí 3D từ LiDAR. Trước khi chiếu pinhole, điểm track phải được đổi từ hệ tọa độ xe sang hệ tọa độ cảm biến bằng p_s = R p + t. Một điểm ngoài FOV, không hữu hạn hoặc nằm sau camera không thể dùng làm đo ảnh hợp lệ. Vì vậy Part G kiểm tra FOV trước, rồi mới dự báo tọa độ ảnh h(x) và tạo z, R cho EKF. Jacobian camera H do platform cung cấp; đừng viết lại một phiên bản khác trong workspace.
+
+    1. Mở student/workspace/camera_fusion.py và đọc # vi: TODO Part G cùng chữ ký của is_in_field_of_view, camera_measurement_prediction, build_camera_measurement.
+    2. Cài phép đổi tọa độ, kiểm tra FOV từ intrinsics và bề rộng ảnh, phép chiếu pinhole và covariance đo. Với tọa độ không hữu hạn hoặc độ sâu x_s ≤ 1e-6, is_in_field_of_view trả False; hàm chiếu phải raise ValueError có ngữ cảnh.
+    3. Chạy bộ test camera được checkpoint chỉ định:
+
+pytest student/tests -v -k "camera_invalid or camera_front or camera_jacobian or camera_fov or student_camera"
+
+
+    1. Khi mọi test phù hợp đã passed, commit với message CP2: <việc vừa làm>.
+
+Tự kiểm tra: Nếu điểm sau camera vẫn được chiếu ra pixel hoặc dữ liệu không hữu hạn đi tiếp, association có thể nhận một cặp gán vô nghĩa. Test FOV, invalid input và Jacobian xác nhận Part G tạo đo mà Part F có thể sử dụng. Khi CP2 qua, bạn đã có cả bộ lọc và mô hình đo cho hai modality.
+
+Bước 4 · CP3 — Gán LiDAR và camera vào track trong Part F
+
+Thời gian: 0:50–1:15. Kết quả cần có: Test association đều passed và một commit CP3.
+Vì sao không gán theo khoảng cách Euclid đơn thuần?
+
+Một detection gần track chưa chắc là cặp đúng nếu độ bất định của track và sensor khác nhau. Part F dùng khoảng cách Mahalanobis bình phương d² = γᵀ S⁻¹ γ, rồi cổng χ² theo số chiều đo để loại cặp quá xa so với độ bất định. Trong các cặp còn hợp lệ, phép gán greedy lấy cặp có cost thấp nhất và bỏ các track/đo đã dùng. Camera còn có điều kiện hình học: cặp ngoài FOV phải bị loại trước khi tính Mahalanobis hoặc chiếu ảnh.
+
+associate_and_update được gọi với sensor tường minh. Điều này vẫn cần ở frame không có đo, vì track management phải biết lượt hiện tại là LiDAR hay camera. Một track không nhận đo LiDAR có thể bị giảm score; camera không được quyết định sự tồn tại của track. Vì thế hàm phải gọi manager.manage_tracks(...) kể cả khi danh sách đo rỗng.
+
+    1. Mở student/workspace/association.py; tìm TODO Part F cho mahalanobis_distance, chi2_gate, association_cost_matrix, pick_next_pair và associate_and_update.
+    2. Nối phép tính innovation/covariance từ Part E với kiểm tra FOV Part G. Khi cần nạp module Kalman, dùng load_workspace_module("kalman") theo repo, không dùng import kalman.
+    3. Cài vòng gán/update và chuyển đúng các phần tử chưa ghép cho manager.manage_tracks(...), kể cả trường hợp không có measurement. Đừng loại bỏ một cặp sau khi đã xóa nó khỏi danh sách chưa ghép mà không cập nhật danh sách còn lại.
+    4. Chạy test, rồi commit khi toàn bộ test phù hợp passed:
+
+pytest student/tests -v -k "mahalanobis or greedy or out_of_fov or association"
+
+
+Tự kiểm tra: Nếu số đo camera ngoài FOV vẫn được xét hoặc frame rỗng bỏ qua manage_tracks, kết quả có thể trông hợp lý ở frame đơn lẻ nhưng sai vòng đời track. Test out_of_fov và association kiểm tra chính những đường đi này. Commit theo mẫu CP3: <việc vừa làm> trước khi chuyển sang Part H.
+
+Bước 5 · CP4 — Quản lý vòng đời track trong Part H
+
+Thời gian: 1:15–1:35. Kết quả cần có: Toàn bộ student/tests không còn failed hoặc xfailed và một commit CP4.
+Sensor nào được quyền tạo và xóa track?
+
+Trong thiết kế track-then-fuse của lab, LiDAR là nguồn quyết định vòng đời. Một hit LiDAR cộng 1/window vào score, tối đa 1; miss trong FOV trừ 1/window. Track đạt score > confirmed_threshold được xác nhận. Một miss đơn lẻ không hạ trạng thái confirmed. Track bị xóa khi bất định vị trí P[0,0] hoặc P[1,1] vượt max_P, khi confirmed có score < delete_threshold, hoặc khi chưa confirmed có score ≤ 0. Camera chỉ update trạng thái EKF, không cộng/trừ score, không khởi tạo hay xóa track.
+
+    1. Mở student/workspace/track_management.py; thực hiện các TODO Part H trong init_track_state_from_meas, update_track_score, should_delete_track. Dùng tham số từ cấu hình/tracking params mà stub cung cấp.
+    2. Kiểm tra riêng luồng hit/miss LiDAR và luồng camera: cùng một đo camera có thể sửa state nhưng không được làm thay đổi score hoặc trạng thái tồn tại.
+    3. Chạy toàn bộ test từ root repo:
+
+pytest student/tests -q
+
+
+    1. Chỉ khi không còn failed hoặc xfailed, commit với message CP4: <việc vừa làm>.
+
+Tự kiểm tra: Test Part A–D đã pass từ CP0; khi toàn bộ E–H cũng pass, workspace đủ điều kiện để chạy tích hợp. Bộ chấm của giảng viên sẽ chạy test gốc trên workspace và yêu cầu giữ nguyên chữ ký hàm. Nếu còn xfailed, một stub vẫn chưa được hoàn thành; nếu có failed, cần sửa hành vi thay vì bỏ test.
+
+Bước 6 · CP5 — Chạy Waymo ở hai chế độ và đọc metric
+
+Thời gian: 1:35–1:50. Kết quả cần có: Sáu artifact từ lần chạy compare với seed 0 và đủ frame của segment mặc định.
+Một RMSE thấp đã đủ để kết luận tracking tốt chưa?
+
+Chưa. metrics.json tính RMSE vị trí 3D trên confirmed tracks được ghép một-một với xe thật trong cổng XY 2 m. Nếu tracker chỉ ghép được rất ít cặp, RMSE có thể thấp mà coverage kém. Hãy đọc RMSE cùng matches, ghost_track_frames, missed_gt_frames. Rubric còn dùng precision_track = matches / (matches + ghost_track_frames) và coverage = matches / det_tp. Hệ số chất lượng là q = hệ_số_RMSE × min(1, precision_track/0.75) × min(1, coverage/0.70): RMSE ≤ 0.45 m nhận hệ số RMSE 1; từ trên 0.45 đến 0.75 m nhận 0.5; cao hơn hoặc null nhận 0. Mức đầy đủ cho từng mode vì thế cần RMSE ≤ 0.45 m, precision_track ≥ 0.75 và coverage ≥ 0.70. Fused không bắt buộc tốt hơn LiDAR, nhưng điều kiện điểm nhất quán yêu cầu rmse_fused − rmse_lidar ≤ 0.05 m.
+
+    1. Mở student/config/paths.yaml, đặt frame_start: 0 và frame_end: 198 cho lần chạy chấm điểm. Bạn có thể thử nhanh tới frame_end: 20 trước, nhưng phải chạy lại đủ frame sau lần sửa code cuối cùng.
+    2. Từ root repo, chạy hai mode trong cùng lệnh với seed cố định:
+
+fusion-run-lab --config student/config/paths.yaml --fusion compare --seed 0
+
+    1. Mở student/artifacts/metrics.json và grade_run.log. Xác nhận fusion_mode là compare, tracking.lidar và tracking.fused đều khác null; mỗi cặp (mode, frame) có đúng một record log. Kiểm tra matches + ghosts == confirmed và matches + misses == valid_gt trên record.
+    2. Đọc thêm metrics_lidar.json, metrics_fused.json, grade_run_lidar.log, grade_run_fused.log để đối chiếu hai mode, rồi commit artifacts với message CP5: <việc vừa làm>. Không sửa tay file trong student/artifacts/.
+
+Tự kiểm tra: Kết quả cần có đủ sáu file: metrics.json, grade_run.log và bốn file theo mode. Nếu fused kém hơn LiDAR hoặc số ghép ít, đó là tín hiệu để rà Part E–H và log, không phải lý do sửa số trong artifact. Camera ở đây được mô phỏng từ nhãn FRONT có nhiễu seeded; nêu giới hạn này khi diễn giải khác biệt giữa hai mode.
+
+Bước 7 · CP6 — Viết báo cáo, tự kiểm tra và nộp
+
+Thời gian: 1:50–2:00. Kết quả cần có: Fork cá nhân đã push, student/SUBMISSION.md đã điền, link repo và commit hash đã nộp trên LMS.
+Bản nộp phải cho người chấm kiểm tra được điều gì?
+
+student/SUBMISSION.md là báo cáo cần điền; file SUBMISSION.md ở root chỉ là hướng dẫn nộp. Báo cáo phải dùng số từ metrics.json và log của chính lần chạy sau sửa code cuối, nêu cả RMSE, matches, ghost/miss để giải thích hai mode. Sáu câu ngắn hỏi về đo LiDAR/camera trong EKF, gating Mahalanobis, track-then-fuse, calibration drift, vai trò sensor ở frame rỗng và điều kiện vòng đời track. Mục khai báo AI là bắt buộc: ghi công cụ, phần đã dùng và cách bạn tự kiểm tra; nếu không dùng, ghi Không dùng AI.
+
+    1. Điền thông tin học viên, tóm tắt hai mode, sáu câu giải thích và khai báo AI trong student/SUBMISSION.md. Dẫn tới code/log cụ thể thay vì mô tả chung; nếu làm bonus, đặt bằng chứng trong student/bonus/ và mô tả đúng phần đã làm.
+    2. Chạy công cụ tự kiểm từ root repo. Chỉ tiếp tục khi dòng cuối báo KẾT QUẢ: SẴN SÀNG NỘP:
+
+python tools/check_submission.py
+
+    1. Giữ đúng tên repo K4-L2L3-DAY23-<HoVaTen>-<MSSV>-SensorFusion và cấu trúc student/workspace/, student/artifacts/, student/SUBMISSION.md. Không commit .tfrecord, .pth, .env, student/config/paths.yaml, file nén hoặc file > 20 MB. Commit và push kết quả cuối:
+
+git add student/workspace student/artifacts student/SUBMISSION.md
+git commit -m "CP6: report and final run"
+git push origin main
+git rev-parse HEAD
+
+
+    1. Trên VLearn, nộp URL fork cá nhân và commit hash 40 ký tự vừa lấy. Mở lại URL để xác nhận metrics.json, grade_run.log và student/SUBMISSION.md ở đúng commit; git status sạch và git log origin/main -1 trùng hash đã nộp.
+
+Hạng mục rubric	Điểm bắt buộc	Bằng chứng chính
+A — Tích hợp Waymo	15	metrics.json, grade_run.log nhất quán
+B — Tracking + fusion Part E–H	60 (45 tự động, 15 thủ công)	Test gốc, code E–H, artifacts và giải thích kỹ thuật
+C — Báo cáo	25	student/SUBMISSION.md với số liệu và sáu câu trả lời
+
+Bonus tối đa +10 chỉ chấm khi phần bắt buộc đã nộp đủ; xem RUBRIC. Điểm trừ, quy định AI và nộp muộn nằm trong RULES. Commit sau từng checkpoint theo mẫu CPx: <việc vừa làm> để lịch sử làm bài có thể truy vết.
+
+Tự kiểm tra cuối: Part E–H không còn TODO, test không còn failed/xfailed, lần chạy compare --seed 0 dùng frame 0–198, sáu artifact được commit, báo cáo và khai báo AI đã điền, công cụ tự kiểm báo sẵn sàng. Repo là bài cá nhân; quy định nguồn cho phép trao đổi ý tưởng/công thức/cách debug, nhưng không chia sẻ hoặc chép code, log, số liệu. Link và hash trên LMS phải dẫn đúng commit bạn muốn được chấm.

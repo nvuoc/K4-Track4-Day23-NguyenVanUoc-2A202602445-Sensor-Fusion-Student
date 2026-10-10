@@ -4,7 +4,7 @@
 
 ## Thông tin học viên
 
-- Họ tên: Nguyen Van Uoc
+- Họ tên: Nguyễn Văn Ước
 - MSSV: 2A202602445
 - Email: nuoc2694@gmail.com
 - Link repo (fork): https://github.com/nvuoc/K4-Track4-Day23-NguyenVanUoc-2A202602445-Sensor-Fusion-Student
